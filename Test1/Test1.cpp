@@ -40,7 +40,7 @@ static PxPvdTransport* gTransport = nullptr;
 // --- Materials -------------------------------------------
 static PxMaterial* gMatGround = nullptr;
 static PxMaterial* gMatBox = nullptr;
-static PxMaterial* gMatActor = nullptr;   // shared for enemy + player capsule
+static PxMaterial* gMatActor = nullptr;
 static PxMaterial* gMatGrenade = nullptr;
 
 // --- Scene objects ---------------------------------------
@@ -105,9 +105,6 @@ static PxVec3 aimDirH()   // horizontal unit vector in aim direction
     return PxVec3(PxSin(gAimYaw), 0.0f, PxCos(gAimYaw)).getNormalized();
 }
 
-// Right vector for strafing.
-// Camera looks slightly downward so the screen-right vector is -X when
-// facing +Z. We negate the geometric right to match what the player sees.
 static PxVec3 strafeRight()
 {
     return PxVec3(-PxCos(gAimYaw), 0.0f, PxSin(gAimYaw)).getNormalized();
@@ -144,7 +141,7 @@ static PxRigidStatic* createStaticBox(PxVec3 pos, PxVec3 half)
 }
 
 // Capsule with vertical axis: PhysX default capsule is along X,
-// rotate 90 deg around Z so the long axis points along Y.
+// rotate 90 deg around Z.
 static PxRigidDynamic* createCapsule(PxVec3 center, bool kinematic)
 {
     PxShape* s = gPhysics->createShape(
@@ -199,7 +196,7 @@ static PxRigidDynamic* createGrenadeSphere(PxVec3 pos)
 static void shoot()
 {
     PxVec3 base = aimDirH();
-    PxVec3 rgt = -strafeRight();  // geometric right for spread offset
+    PxVec3 rgt = -strafeRight();
     PxVec3 up(0, 1, 0);
     PxVec3 dir = (base
         + rgt * (randF() * SPREAD_RAD)
@@ -258,7 +255,6 @@ static void explodeGrenade()
         return;
     }
 
-    // LOS: only check static geometry (walls / boxes).
     // If something static sits between blast center and enemy, damage is blocked.
     PxRaycastBuffer los;
     PxQueryFilterData fdS;
