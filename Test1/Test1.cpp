@@ -8,9 +8,6 @@
 #include "snippetrender/SnippetRender.h"
 #include "snippetrender/SnippetCamera.h"
 
-// NvCloth SDK headers
-// lib/include/NvCloth/  <-- Factory.h Cloth.h Fabric.h Solver.h Callbacks.h Allocator.h Range.h PhaseConfig.h ps/
-// lib/bin/Debug/        <-- NvCloth_x64.lib  NvCloth_x64.dll
 #include <NvCloth/Callbacks.h>
 #include <NvCloth/Factory.h>
 #include <NvCloth/Fabric.h>
@@ -482,10 +479,6 @@ void exitCallback()
 
     if (gFoundation) { gFoundation->release(); gFoundation = nullptr; }
 }
-
-// =========================================================
-// Entrypoint
-// =========================================================
 
 int main()
 {
