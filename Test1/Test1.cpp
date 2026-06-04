@@ -456,7 +456,7 @@ void renderCallback()
     {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
-            "Wind: %.0f   azimuth: %.0f deg (XZ, 0=+X)   |   [W/S/A/D] camera   [ESC] quit",
+            "Wind: %.0f   dir: %.0f deg   |   [W/S/A/D] camera   [ESC] quit",
             gWindStrength, gWindAngle * 180.0f / PxPi);
         Snippets::print(buf);
     }
