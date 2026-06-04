@@ -1,7 +1,4 @@
-﻿#include <iostream>
-#include <vector>
-#include <algorithm>
-#include <cctype>
+﻿#include <vector>
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -11,290 +8,374 @@
 #include "snippetrender/SnippetRender.h"
 #include "snippetrender/SnippetCamera.h"
 
+// NvCloth SDK headers
+// lib/include/NvCloth/  <-- Factory.h Cloth.h Fabric.h Solver.h Callbacks.h Allocator.h Range.h PhaseConfig.h ps/
+// lib/bin/Debug/        <-- NvCloth_x64.lib  NvCloth_x64.dll
+#include <NvCloth/Callbacks.h>
+#include <NvCloth/Factory.h>
+#include <NvCloth/Fabric.h>
+#include <NvCloth/Cloth.h>
+#include <NvCloth/Solver.h>
+
 using namespace physx;
 
 // =========================================================
-// Lab 2: Shooting Simulation
+// Lab 3: Flag Banner – NvCloth Cloth Simulation
 //
 // Controls:
-//   W / S   -- move forward / backward
-//   A / D   -- strafe left / right
-//   J / L   -- rotate aim left / right
-//   I / K   -- grenade pitch up / down
-//   F       -- shoot (raycast, 3 deg spread)
-//   G       -- throw grenade (fuse 3 s)
-//   R       -- reset enemy
-//   ESC     -- quit
+//   W / S / A / D  -- free-fly camera (Snippets default)
+//   ESC            -- quit
 // =========================================================
 
-// --- PhysX core ------------------------------------------
-static PxDefaultAllocator      gAlloc;
-static PxDefaultErrorCallback  gErr;
+// --- PhysX foundation (allocator / error only) -----------
+static PxDefaultAllocator     gAlloc;
+static PxDefaultErrorCallback gErr;
 static PxFoundation* gFoundation = nullptr;
-static PxPhysics* gPhysics = nullptr;
-static PxDefaultCpuDispatcher* gDispatcher = nullptr;
-static PxScene* gScene = nullptr;
-static PxPvd* gPvd = nullptr;
-static PxPvdTransport* gTransport = nullptr;
 
-// --- Materials -------------------------------------------
-static PxMaterial* gMatGround = nullptr;
-static PxMaterial* gMatBox = nullptr;
-static PxMaterial* gMatActor = nullptr;
-static PxMaterial* gMatGrenade = nullptr;
+// --- NvCloth objects -------------------------------------
+static nv::cloth::Factory* gClothFactory = nullptr;
+static nv::cloth::Solver* gClothSolver = nullptr;
+static nv::cloth::Fabric* gClothFabric = nullptr;
+static nv::cloth::Cloth* gCloth = nullptr;
 
-// --- Scene objects ---------------------------------------
-static PxRigidStatic* gGround = nullptr;
-static const int       NUM_BOXES = 5;
-static PxRigidStatic* gBoxes[NUM_BOXES] = {};
-static PxRigidDynamic* gEnemy = nullptr;
-static PxRigidDynamic* gPlayerCapsule = nullptr;  // kinematic, visual only
+// --- Flag mesh dimensions --------------------------------
+static const int   FLAG_COLS = 10;    // vertices along width
+static const int   FLAG_ROWS = 8;     // vertices along height  (80 total >= 50)
+static const float FLAG_W = 3.0f;  // width  (m)
+static const float FLAG_H = 2.0f;  // height (m)
+static const PxVec3 FLAG_TL(0.0f, 4.0f, 0.0f); // top-left corner in world space
 
-// --- Player state ----------------------------------------
-static PxVec3      gPlayerPos(0.0f, 0.0f, -12.0f);
-static const float PLAYER_EYE_H = 1.7f;
-static const float CAPSULE_RADIUS = 0.4f;
-static const float CAPSULE_HALFH = 0.7f;
-// Center of capsule above player feet = radius + halfH
-static const float CAPSULE_CENTER_Y = CAPSULE_RADIUS + CAPSULE_HALFH;  // 1.1 m
-static const float MOVE_STEP = 0.5f;
-static const float FIELD_LIMIT = 18.0f;
+static const int FLAG_VERTS = FLAG_COLS * FLAG_ROWS;
+static const int FLAG_TRIS = (FLAG_COLS - 1) * (FLAG_ROWS - 1) * 2;
 
-static const PxVec3 ENEMY_START(0.0f, CAPSULE_CENTER_Y, 12.0f);
+// NvCloth's AVX solver reads particle positions in 8-float batches.
+// Providing 8 extra dummy particles after the real ones prevents reading past the buffer end.
+static const int FLAG_VERTS_PADDED = FLAG_VERTS + 8;
 
-// --- Aim -------------------------------------------------
-static float gAimYaw = 0.0f;   // radians, horizontal
-static float gAimPitch = 35.0f;  // degrees, for grenade arc
+// Two-colour stripe split
+static const int ROWS_HALF = FLAG_ROWS / 2;
+static const int TRIS_A = ROWS_HALF * (FLAG_COLS - 1) * 2;
+static const int TRIS_B = (FLAG_ROWS - 1 - ROWS_HALF) * (FLAG_COLS - 1) * 2;
 
-// --- Bullet trails ---------------------------------------
-struct BulletTrail { PxVec3 start, end; float lifetime; };
-static std::vector<BulletTrail> gTrails;
-static const float TRAIL_LIFE = 2.5f;
+// Index buffers (built once at startup)
+static PxU32 gTriIdx[FLAG_TRIS * 3]; // full mesh  (normals + wind triangles)
+static PxU32 gTriIdxA[TRIS_A * 3];  // upper stripe (red)
+static PxU32 gTriIdxB[TRIS_B * 3];  // lower stripe (white)
 
-// --- Grenade ---------------------------------------------
-static PxRigidDynamic* gGrenade = nullptr;
-static float           gGrenadeTimer = 0.0f;
-static bool            gGrenadeActive = false;
-static const float     GRENADE_FUSE = 3.0f;
-static const float     GRENADE_RADIUS = 6.0f;
-static const float     GRENADE_SPEED = 15.0f;
+// Per-vertex normals recomputed every frame
+static PxVec4 gNormals[FLAG_VERTS];
 
-// --- Spread ----------------------------------------------
-static const float SPREAD_RAD = 3.0f * PxPi / 180.0f;
+// --- Wind ------------------------------------------------
+static float gWindTime = 0.0f;
+static float gWindStrength = 0.0f;
+static float gWindAngle = 0.0f;
 
 // --- Camera ----------------------------------------------
 static Snippets::Camera* gCamera = nullptr;
-static const float CAM_BACK = 14.0f;
-static const float CAM_UP = 11.0f;
 
 // --- Colours ---------------------------------------------
-static const PxVec3 COL_GROUND(0.30f, 0.30f, 0.30f);
-static const PxVec3 COL_BOX(0.55f, 0.38f, 0.15f);
-static const PxVec3 COL_ENEMY(0.85f, 0.15f, 0.10f);
-static const PxVec3 COL_PLAYER(0.20f, 0.60f, 1.00f);
-static const PxVec3 COL_GRENADE(0.90f, 0.55f, 0.05f);
-static const PxVec3 COL_AIM(1.00f, 0.20f, 0.20f);
-static const PxVec3 COL_TRAIL(1.00f, 0.95f, 0.00f);
+static const PxVec3 COL_GROUND(0.26f, 0.52f, 0.20f);
+static const PxVec3 COL_POLE(0.62f, 0.50f, 0.30f);
+static const PxVec3 COL_FLAG_A(0.85f, 0.12f, 0.12f); // red   (upper half)
+static const PxVec3 COL_FLAG_B(0.94f, 0.94f, 0.90f); // white (lower half)
 
 // =========================================================
-// Direction helpers
+// Helpers
 // =========================================================
 
-static PxVec3 aimDirH()   // horizontal unit vector in aim direction
+static inline int vidx(int c, int r) { return r * FLAG_COLS + c; }
+
+static void buildIndexBuffers()
 {
-    return PxVec3(PxSin(gAimYaw), 0.0f, PxCos(gAimYaw)).getNormalized();
-}
-
-static PxVec3 strafeRight()
-{
-    return PxVec3(-PxCos(gAimYaw), 0.0f, PxSin(gAimYaw)).getNormalized();
-}
-
-static PxVec3 grenadeLaunchDir()
-{
-    float p = gAimPitch * PxPi / 180.0f;
-    return PxVec3(PxSin(gAimYaw) * PxCos(p),
-        PxSin(p),
-        PxCos(gAimYaw) * PxCos(p)).getNormalized();
-}
-
-static float randF() { return ((rand() % 2001) - 1000) / 1000.0f; }
-
-static void clampPlayer()
-{
-    gPlayerPos.x = PxClamp(gPlayerPos.x, -FIELD_LIMIT, FIELD_LIMIT);
-    gPlayerPos.z = PxClamp(gPlayerPos.z, -FIELD_LIMIT, FIELD_LIMIT);
-}
-
-// =========================================================
-// Object creation
-// =========================================================
-
-static PxRigidStatic* createStaticBox(PxVec3 pos, PxVec3 half)
-{
-    PxShape* s = gPhysics->createShape(PxBoxGeometry(half), *gMatBox, true);
-    PxRigidStatic* a = gPhysics->createRigidStatic(PxTransform(pos));
-    a->attachShape(*s);
-    s->release();
-    gScene->addActor(*a);
-    return a;
-}
-
-// Capsule with vertical axis: PhysX default capsule is along X,
-// rotate 90 deg around Z.
-static PxRigidDynamic* createCapsule(PxVec3 center, bool kinematic)
-{
-    PxShape* s = gPhysics->createShape(
-        PxCapsuleGeometry(CAPSULE_RADIUS, CAPSULE_HALFH), *gMatActor, true);
-    s->setLocalPose(PxTransform(PxQuat(PxHalfPi, PxVec3(0, 0, 1))));
-
-    if (kinematic)
-    {
-        // Player capsule: visual only, no collision, no raycasts
-        s->setFlag(PxShapeFlag::eSIMULATION_SHAPE, false);
-        s->setFlag(PxShapeFlag::eSCENE_QUERY_SHAPE, false);
-    }
-
-    PxRigidDynamic* a = gPhysics->createRigidDynamic(PxTransform(center));
-    a->attachShape(*s);
-    s->release();
-
-    if (kinematic)
-    {
-        a->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, true);
-        // Dummy mass required even for kinematics
-        a->setMass(1.0f);
-        a->setMassSpaceInertiaTensor(PxVec3(1.0f));
-    }
-    else
-    {
-        PxRigidBodyExt::updateMassAndInertia(*a, 85.0f);  // ~80 kg enemy
-        a->setLinearDamping(0.1f);
-        a->setAngularDamping(0.5f);
-    }
-
-    gScene->addActor(*a);
-    return a;
-}
-
-static PxRigidDynamic* createGrenadeSphere(PxVec3 pos)
-{
-    PxShape* s = gPhysics->createShape(PxSphereGeometry(0.12f), *gMatGrenade, true);
-    PxRigidDynamic* a = gPhysics->createRigidDynamic(PxTransform(pos));
-    a->attachShape(*s);
-    s->release();
-    PxRigidBodyExt::updateMassAndInertia(*a, 220.0f);
-    a->setLinearDamping(0.02f);
-    gScene->addActor(*a);
-    return a;
-}
-
-// =========================================================
-// Game actions
-// =========================================================
-
-static void shoot()
-{
-    PxVec3 base = aimDirH();
-    PxVec3 rgt = -strafeRight();
-    PxVec3 up(0, 1, 0);
-    PxVec3 dir = (base
-        + rgt * (randF() * SPREAD_RAD)
-        + up * (randF() * SPREAD_RAD)).getNormalized();
-
-    PxVec3 origin = gPlayerPos + PxVec3(0, PLAYER_EYE_H, 0);
-    const float RANGE = 60.0f;
-    PxVec3 hitPos = origin + dir * RANGE;
-
-    PxRaycastBuffer hit;
-    PxQueryFilterData fd;
-    fd.flags = PxQueryFlag::eSTATIC | PxQueryFlag::eDYNAMIC;
-
-    if (gScene->raycast(origin, dir, RANGE, hit, PxHitFlag::eDEFAULT, fd))
-    {
-        hitPos = hit.block.position;
-        if (hit.block.actor == gEnemy)
+    int nAll = 0, nA = 0, nB = 0;
+    for (int r = 0; r < FLAG_ROWS - 1; ++r)
+        for (int c = 0; c < FLAG_COLS - 1; ++c)
         {
-            std::printf("[HIT] Bullet hit the enemy!\n");
-            gEnemy->addForce(dir * 500.0f, PxForceMode::eIMPULSE);
+            PxU32 tl = (PxU32)vidx(c, r);
+            PxU32 tr = (PxU32)vidx(c + 1, r);
+            PxU32 bl = (PxU32)vidx(c, r + 1);
+            PxU32 br = (PxU32)vidx(c + 1, r + 1);
+
+            PxU32 t0[3] = { tl, bl, tr };
+            PxU32 t1[3] = { bl, br, tr };
+
+            for (int k = 0; k < 3; ++k) gTriIdx[nAll++] = t0[k];
+            for (int k = 0; k < 3; ++k) gTriIdx[nAll++] = t1[k];
+
+            if (r < ROWS_HALF)
+            {
+                for (int k = 0; k < 3; ++k) gTriIdxA[nA++] = t0[k];
+                for (int k = 0; k < 3; ++k) gTriIdxA[nA++] = t1[k];
+            }
+            else
+            {
+                for (int k = 0; k < 3; ++k) gTriIdxB[nB++] = t0[k];
+                for (int k = 0; k < 3; ++k) gTriIdxB[nB++] = t1[k];
+            }
         }
-        else
+}
+
+static void computeNormals(const PxVec4* pts)
+{
+    for (int i = 0; i < FLAG_VERTS; ++i)
+        gNormals[i] = PxVec4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    for (int t = 0; t < FLAG_TRIS; ++t)
+    {
+        PxU32 i0 = gTriIdx[t * 3 + 0];
+        PxU32 i1 = gTriIdx[t * 3 + 1];
+        PxU32 i2 = gTriIdx[t * 3 + 2];
+        PxVec3 e0(pts[i1].x - pts[i0].x, pts[i1].y - pts[i0].y, pts[i1].z - pts[i0].z);
+        PxVec3 e1(pts[i2].x - pts[i0].x, pts[i2].y - pts[i0].y, pts[i2].z - pts[i0].z);
+        PxVec3 n = e0.cross(e1);
+        PxVec4 nv(n.x, n.y, n.z, 0.0f);
+        gNormals[i0] += nv;
+        gNormals[i1] += nv;
+        gNormals[i2] += nv;
+    }
+
+    for (int i = 0; i < FLAG_VERTS; ++i)
+    {
+        PxVec3 n(gNormals[i].x, gNormals[i].y, gNormals[i].z);
+        n = n.getNormalized();
+        gNormals[i] = PxVec4(n.x, n.y, n.z, 0.0f);
+    }
+}
+
+// =========================================================
+// Fabric construction (replaces NvClothCookFabricFromMesh)
+//
+// NvCloth fabric layout:
+//   phases[]    -- phase type per set (1=vertical 2=horizontal 3=bending 4=shearing)
+//   sets[]      -- number of constraints in each set (COUNT, not cumulative)
+//   restVals[]  -- rest length per constraint
+//   stiffVals[] -- stiffness per constraint (same size as restVals)
+//   indices[]   -- two particle indices per constraint
+// =========================================================
+
+// Constraints are split into graph-coloured sets so that within each set
+// no two constraints share a particle. This is required by NvCloth's AVX
+// solver which processes constraints in each set in parallel.
+// Each set is also padded to a multiple of 8 (AVX batch size).
+// Padding uses the two pinned corners (invMass=0 on both → zero displacement).
+static void buildConstraints(
+    const std::vector<PxVec3>& pos,
+    std::vector<PxU32>& phases,   // phase type per set
+    std::vector<PxU32>& sets,     // cumulative end index per set
+    std::vector<float>& restVals,
+    std::vector<float>& stiffVals,
+    std::vector<PxU32>& indices)
+{
+    const float restPad = (pos[FLAG_COLS - 1] - pos[0]).magnitude();
+
+    auto add = [&](int i0, int i1)
         {
-            std::printf("[MISS] Bullet hit an obstacle.\n");
+            indices.push_back((PxU32)i0);
+            indices.push_back((PxU32)i1);
+            restVals.push_back((pos[i1] - pos[i0]).magnitude());
+            stiffVals.push_back(1.0f);
+        };
+
+    // Finish current set: pad to multiple of 8, record cumulative end.
+    auto finishSet = [&](size_t setStart, PxU32 phaseType)
+        {
+            while ((restVals.size() - setStart) % 8 != 0)
+            {
+                indices.push_back(0);
+                indices.push_back((PxU32)(FLAG_COLS - 1)); // both pinned → Δpos = 0
+                restVals.push_back(restPad);
+                stiffVals.push_back(1.0f);
+            }
+            phases.push_back(phaseType);
+            sets.push_back((PxU32)restVals.size());
+        };
+
+    size_t s;
+
+    // --- Horizontal stretch  (eHORIZONTAL = 2) ---
+    // 2-colour: even-c set (40) and odd-c set (32)
+    s = restVals.size();
+    for (int r = 0; r < FLAG_ROWS; ++r)
+        for (int c = 0; c < FLAG_COLS - 1; c += 2)
+            add(vidx(c, r), vidx(c + 1, r));
+    finishSet(s, 2); // 40 → 40
+
+    s = restVals.size();
+    for (int r = 0; r < FLAG_ROWS; ++r)
+        for (int c = 1; c < FLAG_COLS - 1; c += 2)
+            add(vidx(c, r), vidx(c + 1, r));
+    finishSet(s, 2); // 32 → 32
+
+    // --- Vertical stretch  (eVERTICAL = 1) ---
+    // 2-colour: even-r set (40) and odd-r set (30 → 32)
+    s = restVals.size();
+    for (int c = 0; c < FLAG_COLS; ++c)
+        for (int r = 0; r < FLAG_ROWS - 1; r += 2)
+            add(vidx(c, r), vidx(c, r + 1));
+    finishSet(s, 1); // 40 → 40
+
+    s = restVals.size();
+    for (int c = 0; c < FLAG_COLS; ++c)
+        for (int r = 1; r < FLAG_ROWS - 1; r += 2)
+            add(vidx(c, r), vidx(c, r + 1));
+    finishSet(s, 1); // 30 → 32
+
+    // --- Shear diagonal 1  (c,r)→(c+1,r+1)  (eSHEARING = 4) ---
+    // 2-colour by c parity
+    s = restVals.size();
+    for (int r = 0; r < FLAG_ROWS - 1; ++r)
+        for (int c = 0; c < FLAG_COLS - 1; c += 2)
+            add(vidx(c, r), vidx(c + 1, r + 1));
+    finishSet(s, 4); // 35 → 40
+
+    s = restVals.size();
+    for (int r = 0; r < FLAG_ROWS - 1; ++r)
+        for (int c = 1; c < FLAG_COLS - 1; c += 2)
+            add(vidx(c, r), vidx(c + 1, r + 1));
+    finishSet(s, 4); // 28 → 32
+
+    // --- Shear diagonal 2  (c+1,r)→(c,r+1)  (eSHEARING = 4) ---
+    s = restVals.size();
+    for (int r = 0; r < FLAG_ROWS - 1; ++r)
+        for (int c = 0; c < FLAG_COLS - 1; c += 2)
+            add(vidx(c + 1, r), vidx(c, r + 1));
+    finishSet(s, 4); // 35 → 40
+
+    s = restVals.size();
+    for (int r = 0; r < FLAG_ROWS - 1; ++r)
+        for (int c = 1; c < FLAG_COLS - 1; c += 2)
+            add(vidx(c + 1, r), vidx(c, r + 1));
+    finishSet(s, 4); // 28 → 32
+
+    // --- Bending horizontal  (c,r)→(c+2,r)  (eBENDING = 3) ---
+    // Requires 3-colouring (c%3) because stride-2 constraints share mid-particle
+    for (int col = 0; col < 3; ++col)
+    {
+        s = restVals.size();
+        for (int r = 0; r < FLAG_ROWS; ++r)
+            for (int c = col; c < FLAG_COLS - 2; c += 3)
+                add(vidx(c, r), vidx(c + 2, r));
+        finishSet(s, 3); // 24, 24, 16 → all already ÷8
+    }
+
+    // --- Bending vertical  (c,r)→(c,r+2)  (eBENDING = 3) ---
+    // 3-colouring by r%3
+    for (int col = 0; col < 3; ++col)
+    {
+        s = restVals.size();
+        for (int c = 0; c < FLAG_COLS; ++c)
+            for (int r = col; r < FLAG_ROWS - 2; r += 3)
+                add(vidx(c, r), vidx(c, r + 2));
+        finishSet(s, 3); // 20 → 24 each
+    }
+    // Total: 14 sets, ~424 constraints
+}
+
+// =========================================================
+// Cloth setup
+// =========================================================
+
+static void buildCloth()
+{
+    buildIndexBuffers();
+
+    // Rest-pose positions: flat vertical grid, top edge at FLAG_TL
+    std::vector<PxVec3> restPos(FLAG_VERTS);
+    const float dw = FLAG_W / (FLAG_COLS - 1);
+    const float dh = FLAG_H / (FLAG_ROWS - 1);
+    for (int r = 0; r < FLAG_ROWS; ++r)
+        for (int c = 0; c < FLAG_COLS; ++c)
+            restPos[vidx(c, r)] = PxVec3(FLAG_TL.x + c * dw,
+                FLAG_TL.y - r * dh,
+                FLAG_TL.z);
+
+    // Build constraint data (NvCloth copies it internally)
+    std::vector<PxU32>  phases, sets, indices;
+    std::vector<float>  restVals, stiffVals;
+    buildConstraints(restPos, phases, sets, restVals, stiffVals, indices);
+
+    // Create fabric directly (no NvClothExt cooker needed)
+    gClothFabric = gClothFactory->createFabric(
+        (PxU32)FLAG_VERTS_PADDED,
+        nv::cloth::Range<const PxU32>(phases.data(), phases.data() + phases.size()),
+        nv::cloth::Range<const PxU32>(sets.data(), sets.data() + sets.size()),
+        nv::cloth::Range<const float>(restVals.data(), restVals.data() + restVals.size()),
+        nv::cloth::Range<const float>(stiffVals.data(), stiffVals.data() + stiffVals.size()),
+        nv::cloth::Range<const PxU32>(indices.data(), indices.data() + indices.size()),
+        nv::cloth::Range<const PxU32>(),  // no tethers
+        nv::cloth::Range<const float>(),  // no tether lengths
+        nv::cloth::Range<const PxU32>(gTriIdx, gTriIdx + FLAG_TRIS * 3));
+
+    // Initial particles: xyz = rest position, w = inverse mass (0 = pinned)
+    // Extra FLAG_VERTS_PADDED - FLAG_VERTS dummy particles at origin pad the
+    // NvCloth position buffer so AVX 8-float batch reads never go past the end.
+    std::vector<PxVec4> initPts(FLAG_VERTS_PADDED, PxVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    for (int r = 0; r < FLAG_ROWS; ++r)
+        for (int c = 0; c < FLAG_COLS; ++c)
+        {
+            const PxVec3& p = restPos[vidx(c, r)];
+            float invMass = 1.0f;
+            if (r == 0 && (c == 0 || c == FLAG_COLS - 1))
+                invMass = 0.0f; // pin top-left and top-right corners (banner)
+            initPts[vidx(c, r)] = PxVec4(p.x, p.y, p.z, invMass);
         }
-    }
-    else
-    {
-        std::printf("[MISS] Bullet hit nothing.\n");
-    }
 
-    gTrails.push_back({ origin, hitPos, TRAIL_LIFE });
+    gCloth = gClothFactory->createCloth(
+        nv::cloth::Range<PxVec4>(initPts.data(), initPts.data() + FLAG_VERTS_PADDED),
+        *gClothFabric);
+
+    gCloth->setGravity(PxVec3(0.0f, -9.81f, 0.0f));
+    gCloth->setDamping(PxVec3(0.9f, 0.9f, 0.9f)); // high damping kills velocity accumulation
+    gCloth->setFriction(0.1f);
+    gCloth->setSolverFrequency(120.0f);
+
+    const PxU32 numPhases = gClothFabric->getNumPhases();
+    std::vector<nv::cloth::PhaseConfig> phaseCfg(numPhases);
+    for (PxU32 i = 0; i < numPhases; ++i)
+    {
+        phaseCfg[i].mPhaseIndex = i;
+        phaseCfg[i].mStiffness = 1.0f;
+        phaseCfg[i].mStiffnessMultiplier = 1.0f;
+        phaseCfg[i].mCompressionLimit = 1.0f;
+        phaseCfg[i].mStretchLimit = 1.0f;
+    }
+    gCloth->setPhaseConfig(nv::cloth::Range<nv::cloth::PhaseConfig>(
+        phaseCfg.data(), phaseCfg.data() + numPhases));
+
+    gClothSolver->addCloth(gCloth);
+
+    // Diagnostic: print initial position of a free particle                                                                      
+    {
+    auto pts = nv::cloth::readCurrentParticles(*gCloth);
+    std::printf("[INIT] numParticles=%u  numPhases=%u\n",
+    gCloth->getNumParticles(), gClothFabric->getNumPhases());
+    std::printf("[INIT] particle[5]  = (%.3f, %.3f, %.3f)  w=%.3f\n",
+    pts[5].x, pts[5].y, pts[5].z, pts[5].w);
+    std::printf("[INIT] particle[79] = (%.3f, %.3f, %.3f)  w=%.3f\n",
+    pts[79].x, pts[79].y, pts[79].z, pts[79].w);
+    std::printf("[INIT] particle[0]  = (%.3f, %.3f, %.3f)  w=%.3f (pinned?)\n",
+    pts[0].x, pts[0].y, pts[0].z, pts[0].w);
+    }
 }
 
-static void explodeGrenade()
+// =========================================================
+// Wind
+// =========================================================
+
+static void updateWind(float dt)
 {
-    if (!gGrenade) return;
+    gWindTime += dt;
+    gWindAngle = gWindTime * 0.15f;
+    gWindStrength = 1.5f + 0.8f * PxSin(gWindTime * 0.4f);
 
-    PxVec3 center = gGrenade->getGlobalPose().p;
-    std::printf("[EXPLOSION] Detonated at (%.1f, %.1f, %.1f)\n",
-        center.x, center.y, center.z);
+    PxVec3 dir(PxCos(gWindAngle),
+        0.03f * PxSin(gWindTime * 0.3f),
+        PxSin(gWindAngle));
+    dir = dir.getNormalized();
 
-    gScene->removeActor(*gGrenade);
-    gGrenade->release();
-    gGrenade = nullptr;
-    gGrenadeActive = false;
-
-    if (!gEnemy) return;
-
-    PxVec3 toEnemy = gEnemy->getGlobalPose().p - center;
-    float  dist = toEnemy.magnitude();
-
-    if (dist >= GRENADE_RADIUS)
-    {
-        std::printf("[EXPLOSION] Enemy out of blast radius (%.2f m).\n", dist);
-        return;
-    }
-
-    // If something static sits between blast center and enemy, damage is blocked.
-    PxRaycastBuffer los;
-    PxQueryFilterData fdS;
-    fdS.flags = PxQueryFlag::eSTATIC;
-    PxVec3 losDir = toEnemy.getNormalized();
-
-    if (gScene->raycast(center, losDir, dist - 0.2f, los, PxHitFlag::eDEFAULT, fdS))
-    {
-        std::printf("[EXPLOSION] Enemy behind cover -- damage blocked! "
-            "(wall at %.2f m)\n", los.block.distance);
-        return;
-    }
-
-    float t = 1.0f - dist / GRENADE_RADIUS;
-    float damage = t * 100.0f;
-    float force = t * 3500.0f;
-    std::printf("[EXPLOSION] Enemy hit! Damage: %.1f/100  (dist %.2f m)\n", damage, dist);
-
-    PxVec3 impulseDir = (losDir + PxVec3(0, 0.4f, 0)).getNormalized();
-    gEnemy->addForce(impulseDir * force, PxForceMode::eIMPULSE);
-}
-
-static void throwGrenade()
-{
-    if (gGrenadeActive) { std::printf("[GRENADE] Already in flight!\n"); return; }
-
-    PxVec3 spawn = gPlayerPos + aimDirH() * 0.5f + PxVec3(0, PLAYER_EYE_H - 0.3f, 0);
-    gGrenade = createGrenadeSphere(spawn);
-    gGrenade->setLinearVelocity(grenadeLaunchDir() * GRENADE_SPEED);
-    gGrenadeTimer = GRENADE_FUSE;
-    gGrenadeActive = true;
-    std::printf("[GRENADE] Thrown! Fuse: %.1f s  (yaw %.0f deg, pitch %.0f deg)\n",
-        GRENADE_FUSE, gAimYaw * 180.0f / PxPi, gAimPitch);
-}
-
-static void resetEnemy()
-{
-    if (gEnemy) { gScene->removeActor(*gEnemy); gEnemy->release(); }
-    gEnemy = createCapsule(ENEMY_START, false);
-    std::printf("[RESET] Enemy returned to start.\n");
+    gCloth->setWindVelocity(dir * gWindStrength);
+    gCloth->setDragCoefficient(0.02f);
+    gCloth->setLiftCoefficient(0.01f);
 }
 
 // =========================================================
@@ -303,85 +384,36 @@ static void resetEnemy()
 
 void initPhysics()
 {
-    std::srand((unsigned)std::time(nullptr));
-
     gFoundation = PxCreateFoundation(PX_PHYSICS_VERSION, gAlloc, gErr);
-    gPvd = PxCreatePvd(*gFoundation);
-    gTransport = PxDefaultPvdSocketTransportCreate("127.0.0.1", 5425, 10000);
-    if (gPvd && gTransport)
-        gPvd->connect(*gTransport, PxPvdInstrumentationFlag::eALL);
 
-    gPhysics = PxCreatePhysics(PX_PHYSICS_VERSION, *gFoundation,
-        PxTolerancesScale(), true, gPvd);
+    nv::cloth::InitializeNvCloth(&gAlloc, &gErr, nullptr, nullptr);
+    gClothFactory = NvClothCreateFactoryCPU();
+    gClothSolver = gClothFactory->createSolver();
 
-    PxSceneDesc sd(gPhysics->getTolerancesScale());
-    sd.gravity = PxVec3(0, -9.81f, 0);
-    gDispatcher = PxDefaultCpuDispatcherCreate(2);
-    sd.cpuDispatcher = gDispatcher;
-    sd.filterShader = PxDefaultSimulationFilterShader;
-    gScene = gPhysics->createScene(sd);
+    buildCloth();
 
-    gMatGround = gPhysics->createMaterial(0.7f, 0.7f, 0.20f);
-    gMatBox = gPhysics->createMaterial(0.5f, 0.5f, 0.10f);
-    gMatActor = gPhysics->createMaterial(0.5f, 0.5f, 0.05f);
-    gMatGrenade = gPhysics->createMaterial(0.4f, 0.4f, 0.55f);
-
-    gGround = PxCreatePlane(*gPhysics, PxPlane(0, 1, 0, 0), *gMatGround);
-    gScene->addActor(*gGround);
-
-    // 5 obstacle boxes
-    gBoxes[0] = createStaticBox(PxVec3(-6.0f, 1.5f, 0.0f), PxVec3(1.5f, 1.5f, 1.5f));
-    gBoxes[1] = createStaticBox(PxVec3(5.5f, 1.5f, 2.5f), PxVec3(1.0f, 1.5f, 2.0f));
-    gBoxes[2] = createStaticBox(PxVec3(-2.5f, 1.5f, 7.5f), PxVec3(2.0f, 1.5f, 1.0f));
-    gBoxes[3] = createStaticBox(PxVec3(4.0f, 1.5f, -4.5f), PxVec3(1.2f, 1.5f, 1.2f));
-    gBoxes[4] = createStaticBox(PxVec3(0.0f, 1.5f, 3.5f), PxVec3(1.0f, 1.5f, 3.5f));
-
-    // Enemy: dynamic capsule (red)
-    gEnemy = createCapsule(ENEMY_START, false);
-
-    // Player: kinematic capsule (blue), no collision or raycast interaction
-    gPlayerCapsule = createCapsule(
-        gPlayerPos + PxVec3(0, CAPSULE_CENTER_Y, 0), true);
-
-    std::printf("=== PhysX Shooter -- Lab Work #2 ===\n");
-    std::printf("  W/S   -- move forward / back\n");
-    std::printf("  A/D   -- strafe left / right\n");
-    std::printf("  J/L   -- rotate aim\n");
-    std::printf("  I/K   -- grenade pitch\n");
-    std::printf("  F     -- shoot\n");
-    std::printf("  G     -- throw grenade\n");
-    std::printf("  R     -- reset enemy\n\n");
+    std::printf("=== NvCloth Flag Banner -- Lab Work #3 ===\n");
+    std::printf("  Mesh  : %d x %d = %d vertices  (%d triangles)\n",
+        FLAG_COLS, FLAG_ROWS, FLAG_VERTS, FLAG_TRIS);
+    std::printf("  Pinned: top-left + top-right corners (banner)\n");
+    std::printf("  Wind direction and strength change over time.\n\n");
 }
 
 // =========================================================
 // Input
 // =========================================================
 
-static void customKeyboard(unsigned char key, int /*x*/, int /*y*/)
+static void customKeyboard(unsigned char key, int x, int y)
 {
-    switch (std::toupper(key))
+    switch (key)
     {
-    case 'W': gPlayerPos += aimDirH() * MOVE_STEP; clampPlayer(); break;
-    case 'S': gPlayerPos -= aimDirH() * MOVE_STEP; clampPlayer(); break;
-    case 'A': gPlayerPos -= strafeRight() * MOVE_STEP; clampPlayer(); break;
-    case 'D': gPlayerPos += strafeRight() * MOVE_STEP; clampPlayer(); break;
-
-    case 'J': gAimYaw -= 0.06f; break;
-    case 'L': gAimYaw += 0.06f; break;
-
-    case 'I': gAimPitch = PxMin(gAimPitch + 2.0f, 75.0f); break;
-    case 'K': gAimPitch = PxMax(gAimPitch - 2.0f, 5.0f); break;
-
-    case 'F': shoot();        break;
-    case 'G': throwGrenade(); break;
-    case 'R': resetEnemy();   break;
-
-    case 27: exit(0); break;  // ESC
-    default:  break;
+    case 27: exit(0); break; // ESC
+    default:
+        gCamera->handleKey(key, x, y);
+        break;
     }
 }
 
-// Stub passed to setupDefault -- never called because we override the handler.
 void keyPress(unsigned char /*key*/, const PxTransform& /*cam*/) {}
 
 // =========================================================
@@ -390,77 +422,58 @@ void keyPress(unsigned char /*key*/, const PxTransform& /*cam*/) {}
 
 void renderCallback()
 {
-    // Move player capsule to follow gPlayerPos (kinematic target)
-    if (gPlayerCapsule)
-    {
-        PxVec3 center = gPlayerPos + PxVec3(0, CAPSULE_CENTER_Y, 0);
-        gPlayerCapsule->setKinematicTarget(PxTransform(center));
-    }
-
-    // Third-person camera: behind + above the player, always looking at player head
-    PxVec3 camEye = gPlayerPos - aimDirH() * CAM_BACK + PxVec3(0, CAM_UP, 0);
-    PxVec3 lookAt = gPlayerPos + PxVec3(0, 1.0f, 0);
-    gCamera->setPose(camEye, (lookAt - camEye).getNormalized());
-
     const float dt = 1.0f / 60.0f;
-    gScene->simulate(dt);
-    gScene->fetchResults(true);
 
-    if (gGrenadeActive) { gGrenadeTimer -= dt; if (gGrenadeTimer <= 0.0f) explodeGrenade(); }
+    updateWind(dt);
 
-    for (auto& t : gTrails) t.lifetime -= dt;
-    gTrails.erase(
-        std::remove_if(gTrails.begin(), gTrails.end(),
-            [](const BulletTrail& t) { return t.lifetime <= 0.0f; }),
-        gTrails.end());
+    gClothSolver->beginSimulation(dt);
+    for (int i = 0; i < gClothSolver->getSimulationChunkCount(); ++i)
+        gClothSolver->simulateChunk(i);
+    gClothSolver->endSimulation();
 
     Snippets::startRender(gCamera);
 
-    // Ground
-    { PxRigidActor* a = gGround; Snippets::renderActors(&a, 1, false, COL_GROUND, nullptr, false, false); }
-
-    // Boxes
+    // Ground quad
     {
-        PxRigidActor* arr[NUM_BOXES]; PxU32 n = 0;
-        for (int i = 0; i < NUM_BOXES; i++) if (gBoxes[i]) arr[n++] = gBoxes[i];
-        if (n) Snippets::renderActors(arr, n, true, COL_BOX, nullptr, false, false);
+        static const PxVec3 gv[4] = {
+            {-9.0f, 0.0f, -6.0f}, { 9.0f, 0.0f, -6.0f},
+            { 9.0f, 0.0f,  6.0f}, {-9.0f, 0.0f,  6.0f} };
+        static const PxU32  gi[6] = { 0, 2, 1,  0, 3, 2 };
+        static const PxVec3 gn[4] = {
+            {0,1,0},{0,1,0},{0,1,0},{0,1,0} };
+        Snippets::renderMesh(4, gv, 2, gi, COL_GROUND, gn);
     }
 
-    // Enemy capsule (red)
-    if (gEnemy)
+    // Flagpole: vertical post + horizontal crossbar
     {
-        PxRigidActor* a = gEnemy; Snippets::renderActors(&a, 1, true, COL_ENEMY, nullptr, false, false);
+        Snippets::DrawLine(
+            PxVec3(FLAG_TL.x, 0.0f, FLAG_TL.z),
+            PxVec3(FLAG_TL.x, FLAG_TL.y + 0.25f, FLAG_TL.z), COL_POLE);
+        Snippets::DrawLine(
+            PxVec3(FLAG_TL.x, FLAG_TL.y, FLAG_TL.z),
+            PxVec3(FLAG_TL.x + FLAG_W, FLAG_TL.y, FLAG_TL.z), COL_POLE);
     }
 
-    // Player capsule (blue)
-    if (gPlayerCapsule)
     {
-        PxRigidActor* a = gPlayerCapsule; Snippets::renderActors(&a, 1, true, COL_PLAYER, nullptr, false, false);
-    }
+        auto pts = nv::cloth::readCurrentParticles(*gCloth);
 
-    // Grenade (orange sphere)
-    if (gGrenade && gGrenadeActive)
-    {
-        PxRigidActor* a = gGrenade; Snippets::renderActors(&a, 1, true, COL_GRENADE, nullptr, false, false);
-    }
+        static int dbgFrame = 0;
+        if (++dbgFrame <= 10 || dbgFrame % 60 == 0)
+            std::printf("[SIM] frame %3d  p[5]=(%.3f,%.3f,%.3f)\n",
+                463 - dbgFrame, pts[5].x, pts[5].y, pts[5].z);
 
-    // Aim ray from player eye
-    {
-        PxVec3 eye = gPlayerPos + PxVec3(0, PLAYER_EYE_H, 0);
-        Snippets::DrawLine(eye, eye + aimDirH() * 25.0f, COL_AIM);
-    }
+        computeNormals(pts.begin());
 
-    // Bullet trails (yellow)
-    for (const auto& t : gTrails) Snippets::DrawLine(t.start, t.end, COL_TRAIL);
+        Snippets::renderMesh(FLAG_VERTS, pts.begin(), TRIS_A, gTriIdxA, COL_FLAG_A, gNormals);
+        Snippets::renderMesh(FLAG_VERTS, pts.begin(), TRIS_B, gTriIdxB, COL_FLAG_B, gNormals);
+    }
 
     // HUD
     {
-        char buf[400];
+        char buf[256];
         std::snprintf(buf, sizeof(buf),
-            "[W/S/A/D]=Move  [J/L]=Aim %.0fdeg  [I/K]=Pitch %.0fdeg  "
-            "[F]=Shoot  [G]=Grenade  [R]=Reset%s",
-            gAimYaw * 180.0f / PxPi, gAimPitch,
-            gGrenadeActive ? "  | GRENADE IN FLIGHT!" : "");
+            "Wind: %.1f m/s   dir: %.0f deg   |   [W/S/A/D] camera   [ESC] quit",
+            gWindStrength, gWindAngle * 180.0f / PxPi);
         Snippets::print(buf);
     }
 
@@ -475,22 +488,14 @@ void exitCallback()
 {
     delete gCamera; gCamera = nullptr;
 
-    if (gGrenade) { gScene->removeActor(*gGrenade);       gGrenade->release();       gGrenade = nullptr; }
-    if (gPlayerCapsule) { gScene->removeActor(*gPlayerCapsule); gPlayerCapsule->release(); gPlayerCapsule = nullptr; }
-    if (gEnemy) { gScene->removeActor(*gEnemy);         gEnemy->release();         gEnemy = nullptr; }
-    for (int i = 0; i < NUM_BOXES; i++)
-        if (gBoxes[i]) { gScene->removeActor(*gBoxes[i]);      gBoxes[i]->release();      gBoxes[i] = nullptr; }
-    if (gGround) { gScene->removeActor(*gGround);        gGround->release();        gGround = nullptr; }
+    if (gCloth && gClothSolver) gClothSolver->removeCloth(gCloth);
+    if (gClothFactory)
+    {
+        NvClothDestroyFactory(gClothFactory);
+        gClothFactory = nullptr;
+    }
+    gCloth = nullptr; gClothFabric = nullptr; gClothSolver = nullptr;
 
-    if (gScene) { gScene->release();      gScene = nullptr; }
-    if (gDispatcher) { gDispatcher->release(); gDispatcher = nullptr; }
-    if (gMatGrenade) { gMatGrenade->release(); gMatGrenade = nullptr; }
-    if (gMatActor) { gMatActor->release();   gMatActor = nullptr; }
-    if (gMatBox) { gMatBox->release();     gMatBox = nullptr; }
-    if (gMatGround) { gMatGround->release();  gMatGround = nullptr; }
-    if (gPhysics) { gPhysics->release();    gPhysics = nullptr; }
-    if (gPvd) { gPvd->release();        gPvd = nullptr; }
-    if (gTransport) { gTransport->release();  gTransport = nullptr; }
     if (gFoundation) { gFoundation->release(); gFoundation = nullptr; }
 }
 
@@ -500,14 +505,15 @@ void exitCallback()
 
 int main()
 {
-    PxVec3 initEye = PxVec3(0, 0, -12) - PxVec3(0, 0, 1) * CAM_BACK + PxVec3(0, CAM_UP, 0);
-    PxVec3 initLook = PxVec3(0, 1, -12);
-    gCamera = new Snippets::Camera(initEye, (initLook - initEye).getNormalized());
+    PxVec3 flagCenter(FLAG_TL.x + FLAG_W * 0.5f,
+        FLAG_TL.y - FLAG_H * 0.5f,
+        FLAG_TL.z);
+    PxVec3 eye = flagCenter + PxVec3(0.0f, 0.5f, 6.5f);
+    gCamera = new Snippets::Camera(eye, (flagCenter - eye).getNormalized());
 
-    Snippets::setupDefault("PhysX Shooter",
+    Snippets::setupDefault("NvCloth Flag Banner",
         gCamera, keyPress, renderCallback, exitCallback);
 
-    // Override keyboard handler so WASD does player movement, not the Snippets camera.
     glutKeyboardFunc(customKeyboard);
 
     initPhysics();
