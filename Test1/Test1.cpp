@@ -145,11 +145,10 @@ static void computeNormals(const PxVec4* pts)
 // =========================================================
 // Fabric construction (replaces NvClothCookFabricFromMesh)
 //
-// NvCloth fabric layout:
-//   phases[]    -- phase type per set (1=vertical 2=horizontal 3=bending 4=shearing)
-//   sets[]      -- number of constraints in each set (COUNT, not cumulative)
+// NvCloth fabric layout (see Factory::createFabric):
+//   phases[]    -- map phase -> set index (0, 1, 2, ...), NOT constraint type
+//   sets[]      -- inclusive prefix sum of rest-value count per set
 //   restVals[]  -- rest length per constraint
-//   stiffVals[] -- stiffness per constraint (same size as restVals)
 //   indices[]   -- two particle indices per constraint
 // =========================================================
 
@@ -160,10 +159,9 @@ static void computeNormals(const PxVec4* pts)
 // Padding uses the two pinned corners (invMass=0 on both → zero displacement).
 static void buildConstraints(
     const std::vector<PxVec3>& pos,
-    std::vector<PxU32>& phases,   // phase type per set
+    std::vector<PxU32>& phases,   // phase -> set index
     std::vector<PxU32>& sets,     // cumulative end index per set
     std::vector<float>& restVals,
-    std::vector<float>& stiffVals,
     std::vector<PxU32>& indices)
 {
     const float restPad = (pos[FLAG_COLS - 1] - pos[0]).magnitude();
@@ -173,20 +171,18 @@ static void buildConstraints(
             indices.push_back((PxU32)i0);
             indices.push_back((PxU32)i1);
             restVals.push_back((pos[i1] - pos[i0]).magnitude());
-            stiffVals.push_back(1.0f);
         };
 
     // Finish current set: pad to multiple of 8, record cumulative end.
-    auto finishSet = [&](size_t setStart, PxU32 phaseType)
+    auto finishSet = [&](size_t setStart)
         {
             while ((restVals.size() - setStart) % 8 != 0)
             {
                 indices.push_back(0);
                 indices.push_back((PxU32)(FLAG_COLS - 1)); // both pinned → Δpos = 0
                 restVals.push_back(restPad);
-                stiffVals.push_back(1.0f);
             }
-            phases.push_back(phaseType);
+            phases.push_back((PxU32)sets.size()); // phase index -> set index
             sets.push_back((PxU32)restVals.size());
         };
 
@@ -198,75 +194,71 @@ static void buildConstraints(
     for (int r = 0; r < FLAG_ROWS; ++r)
         for (int c = 0; c < FLAG_COLS - 1; c += 2)
             add(vidx(c, r), vidx(c + 1, r));
-    finishSet(s, 2); // 40 → 40
+    finishSet(s);
 
     s = restVals.size();
     for (int r = 0; r < FLAG_ROWS; ++r)
         for (int c = 1; c < FLAG_COLS - 1; c += 2)
             add(vidx(c, r), vidx(c + 1, r));
-    finishSet(s, 2); // 32 → 32
+    finishSet(s);
 
-    // --- Vertical stretch  (eVERTICAL = 1) ---
-    // 2-colour: even-r set (40) and odd-r set (30 → 32)
+    // --- Vertical stretch ---
     s = restVals.size();
     for (int c = 0; c < FLAG_COLS; ++c)
         for (int r = 0; r < FLAG_ROWS - 1; r += 2)
             add(vidx(c, r), vidx(c, r + 1));
-    finishSet(s, 1); // 40 → 40
+    finishSet(s);
 
     s = restVals.size();
     for (int c = 0; c < FLAG_COLS; ++c)
         for (int r = 1; r < FLAG_ROWS - 1; r += 2)
             add(vidx(c, r), vidx(c, r + 1));
-    finishSet(s, 1); // 30 → 32
+    finishSet(s);
 
-    // --- Shear diagonal 1  (c,r)→(c+1,r+1)  (eSHEARING = 4) ---
-    // 2-colour by c parity
+    // --- Shear diagonal 1  (c,r)→(c+1,r+1) ---
     s = restVals.size();
     for (int r = 0; r < FLAG_ROWS - 1; ++r)
         for (int c = 0; c < FLAG_COLS - 1; c += 2)
             add(vidx(c, r), vidx(c + 1, r + 1));
-    finishSet(s, 4); // 35 → 40
+    finishSet(s);
 
     s = restVals.size();
     for (int r = 0; r < FLAG_ROWS - 1; ++r)
         for (int c = 1; c < FLAG_COLS - 1; c += 2)
             add(vidx(c, r), vidx(c + 1, r + 1));
-    finishSet(s, 4); // 28 → 32
+    finishSet(s);
 
-    // --- Shear diagonal 2  (c+1,r)→(c,r+1)  (eSHEARING = 4) ---
+    // --- Shear diagonal 2  (c+1,r)→(c,r+1) ---
     s = restVals.size();
     for (int r = 0; r < FLAG_ROWS - 1; ++r)
         for (int c = 0; c < FLAG_COLS - 1; c += 2)
             add(vidx(c + 1, r), vidx(c, r + 1));
-    finishSet(s, 4); // 35 → 40
+    finishSet(s);
 
     s = restVals.size();
     for (int r = 0; r < FLAG_ROWS - 1; ++r)
         for (int c = 1; c < FLAG_COLS - 1; c += 2)
             add(vidx(c + 1, r), vidx(c, r + 1));
-    finishSet(s, 4); // 28 → 32
+    finishSet(s);
 
-    // --- Bending horizontal  (c,r)→(c+2,r)  (eBENDING = 3) ---
-    // Requires 3-colouring (c%3) because stride-2 constraints share mid-particle
+    // --- Bending horizontal  (c,r)→(c+2,r) ---
     for (int col = 0; col < 3; ++col)
     {
         s = restVals.size();
         for (int r = 0; r < FLAG_ROWS; ++r)
             for (int c = col; c < FLAG_COLS - 2; c += 3)
                 add(vidx(c, r), vidx(c + 2, r));
-        finishSet(s, 3); // 24, 24, 16 → all already ÷8
+        finishSet(s);
     }
 
-    // --- Bending vertical  (c,r)→(c,r+2)  (eBENDING = 3) ---
-    // 3-colouring by r%3
+    // --- Bending vertical  (c,r)→(c,r+2) ---
     for (int col = 0; col < 3; ++col)
     {
         s = restVals.size();
         for (int c = 0; c < FLAG_COLS; ++c)
             for (int r = col; r < FLAG_ROWS - 2; r += 3)
                 add(vidx(c, r), vidx(c, r + 2));
-        finishSet(s, 3); // 20 → 24 each
+        finishSet(s);
     }
     // Total: 14 sets, ~424 constraints
 }
@@ -291,8 +283,8 @@ static void buildCloth()
 
     // Build constraint data (NvCloth copies it internally)
     std::vector<PxU32>  phases, sets, indices;
-    std::vector<float>  restVals, stiffVals;
-    buildConstraints(restPos, phases, sets, restVals, stiffVals, indices);
+    std::vector<float>  restVals;
+    buildConstraints(restPos, phases, sets, restVals, indices);
 
     // Create fabric directly (no NvClothExt cooker needed)
     gClothFabric = gClothFactory->createFabric(
@@ -300,7 +292,7 @@ static void buildCloth()
         nv::cloth::Range<const PxU32>(phases.data(), phases.data() + phases.size()),
         nv::cloth::Range<const PxU32>(sets.data(), sets.data() + sets.size()),
         nv::cloth::Range<const float>(restVals.data(), restVals.data() + restVals.size()),
-        nv::cloth::Range<const float>(stiffVals.data(), stiffVals.data() + stiffVals.size()),
+        nv::cloth::Range<const float>(),  // no per-constraint stiffness → use PhaseConfig
         nv::cloth::Range<const PxU32>(indices.data(), indices.data() + indices.size()),
         nv::cloth::Range<const PxU32>(),  // no tethers
         nv::cloth::Range<const float>(),  // no tether lengths
@@ -314,7 +306,7 @@ static void buildCloth()
         for (int c = 0; c < FLAG_COLS; ++c)
         {
             const PxVec3& p = restPos[vidx(c, r)];
-            float invMass = 1.0f;
+            float invMass = 1.0f / 78.0f; // ~1 kg total cloth mass
             if (r == 0 && (c == 0 || c == FLAG_COLS - 1))
                 invMass = 0.0f; // pin top-left and top-right corners (banner)
             initPts[vidx(c, r)] = PxVec4(p.x, p.y, p.z, invMass);
@@ -325,36 +317,45 @@ static void buildCloth()
         *gClothFabric);
 
     gCloth->setGravity(PxVec3(0.0f, -9.81f, 0.0f));
-    gCloth->setDamping(PxVec3(0.9f, 0.9f, 0.9f)); // high damping kills velocity accumulation
-    gCloth->setFriction(0.1f);
+    gCloth->setDamping(PxVec3(0.05f, 0.05f, 0.05f));
+    gCloth->setFriction(0.25f);
     gCloth->setSolverFrequency(120.0f);
 
     const PxU32 numPhases = gClothFabric->getNumPhases();
     std::vector<nv::cloth::PhaseConfig> phaseCfg(numPhases);
     for (PxU32 i = 0; i < numPhases; ++i)
     {
-        phaseCfg[i].mPhaseIndex = i;
-        phaseCfg[i].mStiffness = 1.0f;
+        phaseCfg[i].mPhaseIndex = (uint16_t)i;
+        phaseCfg[i].mStiffness = 0.8f;
         phaseCfg[i].mStiffnessMultiplier = 1.0f;
         phaseCfg[i].mCompressionLimit = 1.0f;
-        phaseCfg[i].mStretchLimit = 1.0f;
+        phaseCfg[i].mStretchLimit = 1.05f;
     }
     gCloth->setPhaseConfig(nv::cloth::Range<nv::cloth::PhaseConfig>(
         phaseCfg.data(), phaseCfg.data() + numPhases));
 
+    // Ground plane y = 0 keeps the flag from falling through the floor
+    {
+        const PxVec4 groundPlane(0.0f, 1.0f, 0.0f, 0.0f);
+        gCloth->setPlanes(nv::cloth::Range<const PxVec4>(&groundPlane, &groundPlane + 1), 0, 1);
+        const PxU32 groundMask = 1u;
+        gCloth->setConvexes(nv::cloth::Range<const PxU32>(&groundMask, &groundMask + 1), 0, 1);
+    }
+
     gClothSolver->addCloth(gCloth);
 
-    // Diagnostic: print initial position of a free particle                                                                      
+    // Diagnostic: print initial positions of pinned corners and a free particle
     {
-    auto pts = nv::cloth::readCurrentParticles(*gCloth);
-    std::printf("[INIT] numParticles=%u  numPhases=%u\n",
-    gCloth->getNumParticles(), gClothFabric->getNumPhases());
-    std::printf("[INIT] particle[5]  = (%.3f, %.3f, %.3f)  w=%.3f\n",
-    pts[5].x, pts[5].y, pts[5].z, pts[5].w);
-    std::printf("[INIT] particle[79] = (%.3f, %.3f, %.3f)  w=%.3f\n",
-    pts[79].x, pts[79].y, pts[79].z, pts[79].w);
-    std::printf("[INIT] particle[0]  = (%.3f, %.3f, %.3f)  w=%.3f (pinned?)\n",
-    pts[0].x, pts[0].y, pts[0].z, pts[0].w);
+        auto pts = nv::cloth::readCurrentParticles(*gCloth);
+        const int topRight = vidx(FLAG_COLS - 1, 0);
+        std::printf("[INIT] numParticles=%u  numPhases=%u  numSets=%u\n",
+            gCloth->getNumParticles(), gClothFabric->getNumPhases(), gClothFabric->getNumSets());
+        std::printf("[INIT] particle[0]  = (%.3f, %.3f, %.3f)  w=%.3f (top-left)\n",
+            pts[0].x, pts[0].y, pts[0].z, pts[0].w);
+        std::printf("[INIT] particle[%d] = (%.3f, %.3f, %.3f)  w=%.3f (top-right)\n",
+            topRight, pts[topRight].x, pts[topRight].y, pts[topRight].z, pts[topRight].w);
+        std::printf("[INIT] particle[5]  = (%.3f, %.3f, %.3f)  w=%.3f\n",
+            pts[5].x, pts[5].y, pts[5].z, pts[5].w);
     }
 }
 
@@ -366,16 +367,16 @@ static void updateWind(float dt)
 {
     gWindTime += dt;
     gWindAngle = gWindTime * 0.15f;
-    gWindStrength = 1.5f + 0.8f * PxSin(gWindTime * 0.4f);
+    gWindStrength = 1.0f + 0.5f * PxSin(gWindTime * 0.4f);
 
     PxVec3 dir(PxCos(gWindAngle),
-        0.03f * PxSin(gWindTime * 0.3f),
+        0.02f * PxSin(gWindTime * 0.3f),
         PxSin(gWindAngle));
     dir = dir.getNormalized();
 
     gCloth->setWindVelocity(dir * gWindStrength);
-    gCloth->setDragCoefficient(0.02f);
-    gCloth->setLiftCoefficient(0.01f);
+    gCloth->setDragCoefficient(0.015f);
+    gCloth->setLiftCoefficient(0.008f);
 }
 
 // =========================================================
@@ -459,8 +460,13 @@ void renderCallback()
 
         static int dbgFrame = 0;
         if (++dbgFrame <= 10 || dbgFrame % 60 == 0)
+        {
+            const PxVec4& p = pts[5];
             std::printf("[SIM] frame %3d  p[5]=(%.3f,%.3f,%.3f)\n",
-                463 - dbgFrame, pts[5].x, pts[5].y, pts[5].z);
+                dbgFrame, p.x, p.y, p.z);
+            if (!PxIsFinite(p.x) || !PxIsFinite(p.y) || !PxIsFinite(p.z))
+                std::printf("[SIM] ERROR: NaN detected at frame %d\n", dbgFrame);
+        }
 
         computeNormals(pts.begin());
 
