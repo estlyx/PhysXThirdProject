@@ -52,15 +52,14 @@ static const int FLAG_TRIS = (FLAG_COLS - 1) * (FLAG_ROWS - 1) * 2;
 // Providing 8 extra dummy particles after the real ones prevents reading past the buffer end.
 static const int FLAG_VERTS_PADDED = FLAG_VERTS + 8;
 
-// Two-colour stripe split
-static const int ROWS_HALF = FLAG_ROWS / 2;
-static const int TRIS_A = ROWS_HALF * (FLAG_COLS - 1) * 2;
-static const int TRIS_B = (FLAG_ROWS - 1 - ROWS_HALF) * (FLAG_COLS - 1) * 2;
+static inline int vidx(int c, int r) { return r * FLAG_COLS + c; }
 
-// Index buffers (built once at startup)
-static PxU32 gTriIdx[FLAG_TRIS * 3]; // full mesh  (normals + wind triangles)
-static PxU32 gTriIdxA[TRIS_A * 3];  // upper stripe (red)
-static PxU32 gTriIdxB[TRIS_B * 3];  // lower stripe (white)
+// Pinned corners (AB from bottom-left): A = bottom-left, B = top-left
+static const int PIN_A = vidx(0, FLAG_ROWS - 1);
+static const int PIN_B = vidx(0, 0);
+
+// Index buffer (built once at startup)
+static PxU32 gTriIdx[FLAG_TRIS * 3];
 
 // Per-vertex normals recomputed every frame
 static PxVec4 gNormals[FLAG_VERTS];
@@ -76,18 +75,15 @@ static Snippets::Camera* gCamera = nullptr;
 // --- Colours ---------------------------------------------
 static const PxVec3 COL_GROUND(0.26f, 0.52f, 0.20f);
 static const PxVec3 COL_POLE(0.62f, 0.50f, 0.30f);
-static const PxVec3 COL_FLAG_A(0.85f, 0.12f, 0.12f); // red   (upper half)
-static const PxVec3 COL_FLAG_B(0.94f, 0.94f, 0.90f); // white (lower half)
+static const PxVec3 COL_FLAG(0.94f, 0.94f, 0.90f);
 
 // =========================================================
 // Helpers
 // =========================================================
 
-static inline int vidx(int c, int r) { return r * FLAG_COLS + c; }
-
 static void buildIndexBuffers()
 {
-    int nAll = 0, nA = 0, nB = 0;
+    int n = 0;
     for (int r = 0; r < FLAG_ROWS - 1; ++r)
         for (int c = 0; c < FLAG_COLS - 1; ++c)
         {
@@ -99,19 +95,8 @@ static void buildIndexBuffers()
             PxU32 t0[3] = { tl, bl, tr };
             PxU32 t1[3] = { bl, br, tr };
 
-            for (int k = 0; k < 3; ++k) gTriIdx[nAll++] = t0[k];
-            for (int k = 0; k < 3; ++k) gTriIdx[nAll++] = t1[k];
-
-            if (r < ROWS_HALF)
-            {
-                for (int k = 0; k < 3; ++k) gTriIdxA[nA++] = t0[k];
-                for (int k = 0; k < 3; ++k) gTriIdxA[nA++] = t1[k];
-            }
-            else
-            {
-                for (int k = 0; k < 3; ++k) gTriIdxB[nB++] = t0[k];
-                for (int k = 0; k < 3; ++k) gTriIdxB[nB++] = t1[k];
-            }
+            for (int k = 0; k < 3; ++k) gTriIdx[n++] = t0[k];
+            for (int k = 0; k < 3; ++k) gTriIdx[n++] = t1[k];
         }
 }
 
@@ -164,7 +149,7 @@ static void buildConstraints(
     std::vector<float>& restVals,
     std::vector<PxU32>& indices)
 {
-    const float restPad = (pos[FLAG_COLS - 1] - pos[0]).magnitude();
+    const float restPad = (pos[PIN_A] - pos[PIN_B]).magnitude();
 
     auto add = [&](int i0, int i1)
         {
@@ -178,8 +163,8 @@ static void buildConstraints(
         {
             while ((restVals.size() - setStart) % 8 != 0)
             {
-                indices.push_back(0);
-                indices.push_back((PxU32)(FLAG_COLS - 1)); // both pinned → Δpos = 0
+                indices.push_back((PxU32)PIN_B);
+                indices.push_back((PxU32)PIN_A); // both pinned → Δpos = 0
                 restVals.push_back(restPad);
             }
             phases.push_back((PxU32)sets.size()); // phase index -> set index
@@ -307,8 +292,8 @@ static void buildCloth()
         {
             const PxVec3& p = restPos[vidx(c, r)];
             float invMass = 1.0f / 78.0f; // ~1 kg total cloth mass
-            if (r == 0 && (c == 0 || c == FLAG_COLS - 1))
-                invMass = 0.0f; // pin top-left and top-right corners (banner)
+            if (c == 0 && (r == 0 || r == FLAG_ROWS - 1))
+                invMass = 0.0f; // pin A (bottom-left) and B (top-left)
             initPts[vidx(c, r)] = PxVec4(p.x, p.y, p.z, invMass);
         }
 
@@ -347,13 +332,12 @@ static void buildCloth()
     // Diagnostic: print initial positions of pinned corners and a free particle
     {
         auto pts = nv::cloth::readCurrentParticles(*gCloth);
-        const int topRight = vidx(FLAG_COLS - 1, 0);
         std::printf("[INIT] numParticles=%u  numPhases=%u  numSets=%u\n",
             gCloth->getNumParticles(), gClothFabric->getNumPhases(), gClothFabric->getNumSets());
-        std::printf("[INIT] particle[0]  = (%.3f, %.3f, %.3f)  w=%.3f (top-left)\n",
-            pts[0].x, pts[0].y, pts[0].z, pts[0].w);
-        std::printf("[INIT] particle[%d] = (%.3f, %.3f, %.3f)  w=%.3f (top-right)\n",
-            topRight, pts[topRight].x, pts[topRight].y, pts[topRight].z, pts[topRight].w);
+        std::printf("[INIT] particle[%d] = (%.3f, %.3f, %.3f)  w=%.3f (B, top-left)\n",
+            PIN_B, pts[PIN_B].x, pts[PIN_B].y, pts[PIN_B].z, pts[PIN_B].w);
+        std::printf("[INIT] particle[%d] = (%.3f, %.3f, %.3f)  w=%.3f (A, bottom-left)\n",
+            PIN_A, pts[PIN_A].x, pts[PIN_A].y, pts[PIN_A].z, pts[PIN_A].w);
         std::printf("[INIT] particle[5]  = (%.3f, %.3f, %.3f)  w=%.3f\n",
             pts[5].x, pts[5].y, pts[5].z, pts[5].w);
     }
@@ -367,7 +351,7 @@ static void updateWind(float dt)
 {
     gWindTime += dt;
     gWindAngle = gWindTime * 0.15f;
-    gWindStrength = 1.0f + 0.5f * PxSin(gWindTime * 0.4f);
+    gWindStrength = 200.0f + 100.0f * PxSin(gWindTime * 0.4f); // 100–300
 
     PxVec3 dir(PxCos(gWindAngle),
         0.02f * PxSin(gWindTime * 0.3f),
@@ -375,8 +359,8 @@ static void updateWind(float dt)
     dir = dir.getNormalized();
 
     gCloth->setWindVelocity(dir * gWindStrength);
-    gCloth->setDragCoefficient(0.015f);
-    gCloth->setLiftCoefficient(0.008f);
+    gCloth->setDragCoefficient(0.022f);
+    gCloth->setLiftCoefficient(0.012f);
 }
 
 // =========================================================
@@ -396,7 +380,7 @@ void initPhysics()
     std::printf("=== NvCloth Flag Banner -- Lab Work #3 ===\n");
     std::printf("  Mesh  : %d x %d = %d vertices  (%d triangles)\n",
         FLAG_COLS, FLAG_ROWS, FLAG_VERTS, FLAG_TRIS);
-    std::printf("  Pinned: top-left + top-right corners (banner)\n");
+    std::printf("  Pinned: left edge — A (bottom-left) + B (top-left)\n");
     std::printf("  Wind direction and strength change over time.\n\n");
 }
 
@@ -445,15 +429,10 @@ void renderCallback()
         Snippets::renderMesh(4, gv, 2, gi, COL_GROUND, gn);
     }
 
-    // Flagpole: vertical post + horizontal crossbar
-    {
-        Snippets::DrawLine(
-            PxVec3(FLAG_TL.x, 0.0f, FLAG_TL.z),
-            PxVec3(FLAG_TL.x, FLAG_TL.y + 0.25f, FLAG_TL.z), COL_POLE);
-        Snippets::DrawLine(
-            PxVec3(FLAG_TL.x, FLAG_TL.y, FLAG_TL.z),
-            PxVec3(FLAG_TL.x + FLAG_W, FLAG_TL.y, FLAG_TL.z), COL_POLE);
-    }
+    // Flagpole: vertical post along pinned left edge
+    Snippets::DrawLine(
+        PxVec3(FLAG_TL.x, 0.0f, FLAG_TL.z),
+        PxVec3(FLAG_TL.x, FLAG_TL.y + 0.25f, FLAG_TL.z), COL_POLE);
 
     {
         auto pts = nv::cloth::readCurrentParticles(*gCloth);
@@ -470,15 +449,14 @@ void renderCallback()
 
         computeNormals(pts.begin());
 
-        Snippets::renderMesh(FLAG_VERTS, pts.begin(), TRIS_A, gTriIdxA, COL_FLAG_A, gNormals);
-        Snippets::renderMesh(FLAG_VERTS, pts.begin(), TRIS_B, gTriIdxB, COL_FLAG_B, gNormals);
+        Snippets::renderMesh(FLAG_VERTS, pts.begin(), FLAG_TRIS, gTriIdx, COL_FLAG, gNormals);
     }
 
     // HUD
     {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
-            "Wind: %.1f m/s   dir: %.0f deg   |   [W/S/A/D] camera   [ESC] quit",
+            "Wind: %.0f   azimuth: %.0f deg (XZ, 0=+X)   |   [W/S/A/D] camera   [ESC] quit",
             gWindStrength, gWindAngle * 180.0f / PxPi);
         Snippets::print(buf);
     }
